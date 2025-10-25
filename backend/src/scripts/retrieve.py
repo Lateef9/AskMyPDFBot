@@ -1,10 +1,14 @@
 import sys
 import os
+import warnings
+import requests
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from supabase import create_client
 from langgraph.graph import StateGraph, END
 from typing import Dict, TypedDict, List
+
+# Suppress Pydantic V1 deprecation warning
+warnings.filterwarnings("ignore", message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater")
 
 # Environment variables
 from dotenv import load_dotenv
@@ -18,12 +22,9 @@ if not all([supabase_url, supabase_key, openai_api_key]):
     missing = [k for k, v in [("SUPABASE_URL", supabase_url), ("SUPABASE_KEY", supabase_key), ("OPENAI_API_KEY", openai_api_key)] if not v]
     raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 
-# Supabase setup
-supabase = create_client(supabase_url, supabase_key)
-
 # OpenAI setup
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_api_key)
-llm = ChatOpenAI(model="gpt-3.5-turbo", openai_api_key=openai_api_key)
+llm = ChatOpenAI(model="gpt-4o", openai_api_key=openai_api_key)
 
 # LangGraph state
 class RetrievalState(TypedDict):
@@ -34,14 +35,31 @@ class RetrievalState(TypedDict):
 # LangGraph nodes
 def retrieve_documents(state: RetrievalState) -> RetrievalState:
     try:
+        # Generate embedding for the query
         query_embedding = embeddings.embed_query(state["query"])
         if len(query_embedding) != 1536:
             raise ValueError(f"Query embedding has {len(query_embedding)} dimensions, expected 1536")
-        response = supabase.rpc("match_documents", {
+        
+        # Use REST API to call the match_documents function for semantic search
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json"
+        }
+        
+        url = f"{supabase_url}/rest/v1/rpc/match_documents"
+        payload = {
             "query_embedding": query_embedding,
             "match_count": 4
-        }).execute()
-        documents = [{"page_content": doc["content"], "metadata": doc["metadata"]} for doc in response.data]
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            raise RuntimeError(f"Supabase RPC call failed: {response.status_code} - {response.text}")
+        
+        # Extract documents with similarity scores
+        documents = [{"page_content": doc["content"], "metadata": doc["metadata"], "similarity": doc["similarity"]} for doc in response.json()]
+        
     except Exception as e:
         raise RuntimeError(f"Retrieval failed: {str(e)}")
     return {"query": state["query"], "documents": documents, "answer": ""}

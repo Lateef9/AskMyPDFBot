@@ -1,11 +1,15 @@
 import sys
 import os
+import warnings
+import requests
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from supabase import create_client
 from langgraph.graph import StateGraph, END
 from typing import Dict, TypedDict, List
+
+# Suppress Pydantic V1 deprecation warning
+warnings.filterwarnings("ignore", message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater")
 
 # Environment variables
 from dotenv import load_dotenv
@@ -18,9 +22,6 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 if not all([supabase_url, supabase_key, openai_api_key]):
     missing = [k for k, v in [("SUPABASE_URL", supabase_url), ("SUPABASE_KEY", supabase_key), ("OPENAI_API_KEY", openai_api_key)] if not v]
     raise ValueError(f"Missing environment variables: {', '.join(missing)}")
-
-# Supabase setup
-supabase = create_client(supabase_url, supabase_key)
 
 # OpenAI embeddings setup
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=openai_api_key)
@@ -54,13 +55,27 @@ def generate_embeddings(state: IngestionState) -> IngestionState:
 
 def store_in_supabase(state: IngestionState) -> IngestionState:
     try:
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+        
+        url = f"{supabase_url}/rest/v1/documents"
+        
         for doc, embedding in zip(state["documents"], state["embeddings"]):
+            # Convert embedding to proper vector format for Supabase
+            embedding_vector = f"[{','.join(map(str, embedding))}]"
+            
             data = {
                 "content": doc.page_content,
-                "embedding": embedding,
+                "embedding": embedding_vector,  # Store as vector string
                 "metadata": doc.metadata
             }
-            supabase.table("documents").insert(data).execute()
+            response = requests.post(url, headers=headers, json=data)
+            if response.status_code not in [200, 201]:
+                raise RuntimeError(f"Supabase insert failed: {response.status_code} - {response.text}")
     except Exception as e:
         raise RuntimeError(f"Supabase insert failed: {str(e)}")
     return state
